@@ -23,9 +23,15 @@ public static class Startup
 	private static void ConfigureServices(WebApplicationBuilder builder)
 	{
 		builder.Services.AddControllers();
-		builder.Services.AddSingleton<apiController>();
 		builder.Services.Configure<CameraConfig>(builder.Configuration.GetSection("Camera"));
 		builder.Services.AddSingleton(resolver => resolver.GetRequiredService<IOptions<CameraConfig>>().Value);
+		
+		// Odoo ERP API Integration Registration
+		builder.Services.Configure<OdooConfig>(builder.Configuration.GetSection("Odoo"));
+		builder.Services.AddSingleton(resolver => resolver.GetRequiredService<IOptions<OdooConfig>>().Value);
+		builder.Services.AddHttpClient<OdooService>();
+
+		builder.Services.AddSingleton<apiController>();
 		builder.Services.AddHostedService<BackgroundWorkerService>();
 		builder.Services.AddCors(delegate(CorsOptions p)
 		{
@@ -54,6 +60,6 @@ public static class Startup
 	{
 		Console.WriteLine("afterstart orloo ");
 		apiController apiController2 = services.GetRequiredService<apiController>();
-		apiController2.Kholboy();
+		_ = apiController2.Kholboy();
 	}
 }

@@ -20,17 +20,16 @@ public class BackgroundWorkerService : BackgroundService
 	{
 		while (!stoppingToken.IsCancellationRequested)
 		{
-			await Task.Delay(TimeSpan.FromSeconds(59.0), stoppingToken);
 			try
 			{
 				_logger.LogInformation("Worker running at : {time}", DateTime.Now);
-				_apiController.HeartBeat();
+				await _apiController.HeartBeat();
 			}
 			catch (Exception exception)
 			{
 				_logger.LogError(exception, "Heartbeat aldaa");
 			}
-			await Task.Delay(10000, stoppingToken);
+			await Task.Delay(TimeSpan.FromSeconds(15.0), stoppingToken);
 		}
 	}
 }
