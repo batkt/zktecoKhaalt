@@ -58,8 +58,8 @@ public static class Startup
 
 	public static void afterStart(IServiceProvider services)
 	{
-		Console.WriteLine("afterstart orloo ");
-		apiController apiController2 = services.GetRequiredService<apiController>();
-		_ = apiController2.Kholboy();
+		// Console.WriteLine("afterstart orloo ");
+		// apiController apiController2 = services.GetRequiredService<apiController>();
+		// _ = apiController2.Kholboy();
 	}
 }

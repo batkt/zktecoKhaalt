@@ -22,7 +22,7 @@ public class BackgroundWorkerService : BackgroundService
 		{
 			try
 			{
-				_logger.LogInformation("Worker running at : {time}", DateTime.Now);
+				// _logger.LogInformation("Worker running at : {time}", DateTime.Now);
 				await _apiController.HeartBeat();
 			}
 			catch (Exception exception)

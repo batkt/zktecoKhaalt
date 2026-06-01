@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading.Tasks;
@@ -43,7 +44,7 @@ public class apiController : ControllerBase
 
 			IntPtr result = await DeviceData.RefreshRemoveUser(ip, _odooService);
 			logs.Add($"{ip} scan => {result}");
-			Console.WriteLine($"{ip} scan ret --- >> {result}");
+			// Console.WriteLine($"{ip} scan ret --- >> {result}");
 		}
 
 		return Ok(logs);
@@ -81,7 +82,8 @@ public class apiController : ControllerBase
 		{
 			return BadRequest("Invalid payload.");
 		}
-		return await RegisterBarcodesAsync(request.Barcodes);
+		bool isOdoo = !string.IsNullOrEmpty(request.BaiguullagiinId);
+		return await RegisterBarcodesAsync(request.Barcodes, isOdoo);
 	}
 
 	[Route("userKhadgalakh/{barCodes}")]
@@ -102,10 +104,12 @@ public class apiController : ControllerBase
 		{
 			try
 			{
-				var request = JsonSerializer.Deserialize<UserKhadgalakhRequest>(decoded);
+				var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+				var request = JsonSerializer.Deserialize<UserKhadgalakhRequest>(decoded, options);
 				if (request != null && request.Barcodes != null)
 				{
-					return await RegisterBarcodesAsync(request.Barcodes);
+					bool isOdoo = !string.IsNullOrEmpty(request.BaiguullagiinId);
+					return await RegisterBarcodesAsync(request.Barcodes, isOdoo);
 				}
 			}
 			catch (Exception ex)
@@ -126,10 +130,10 @@ public class apiController : ControllerBase
 				list.Add(new BarcodeItem { Barcode = trimmed, Point = 1 });
 			}
 		}
-		return await RegisterBarcodesAsync(list);
+		return await RegisterBarcodesAsync(list, false);
 	}
 
-	private async Task<ActionResult<string>> RegisterBarcodesAsync(List<BarcodeItem> barcodes)
+	private async Task<ActionResult<string>> RegisterBarcodesAsync(List<BarcodeItem> barcodes, bool isOdoo)
 	{
 		if (barcodes == null || barcodes.Count == 0)
 		{
@@ -141,21 +145,49 @@ public class apiController : ControllerBase
 
 		foreach (var item in barcodes)
 		{
-			string barcode = item.Barcode?.ToString()?.Trim() ?? "";
-			if (string.IsNullOrEmpty(barcode))
+			string barcode = item.Barcode?.ToString()?.Trim() ?? 
+			                 item.Code?.ToString()?.Trim() ?? 
+			                 item.CodeQr?.ToString()?.Trim() ?? 
+			                 item.CardNo?.ToString()?.Trim() ?? 
+			                 item.Card_No?.ToString()?.Trim() ?? "";
+
+			if (string.IsNullOrEmpty(barcode) || barcode.Equals("null", StringComparison.OrdinalIgnoreCase))
 			{
 				continue;
 			}
 
+			// Dynamically check Odoo: if the card exists in Odoo database, register it as -1.0 so points are decremented via the live API
+			double pointsToSave = isOdoo ? -1.0 : item.Point;
+			try
+			{
+				var odooInfo = await _odooService.GetOdooCardInfoAsync(barcode);
+				if (odooInfo != null && odooInfo.Success && odooInfo.Data != null)
+				{
+					pointsToSave = -1.0;
+					Console.WriteLine($"[REGISTRATION] Barcode {barcode} detected as Odoo-managed. Automatically mapping to -1.0.");
+				}
+				else
+				{
+					Console.WriteLine($"[REGISTRATION] Barcode {barcode} not found on Odoo. Mapping to local value: {pointsToSave}.");
+				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"[REGISTRATION] Error querying Odoo for barcode {barcode}: {ex.Message}. Using default mapping: {pointsToSave}.");
+			}
+
 			// Save the barcode's point allowance locally in our JSON database
-			await _odooService.SaveLocalMembershipPointsAsync(barcode, item.Point);
+			await _odooService.SaveLocalMembershipPointsAsync(barcode, pointsToSave);
 			validBarCodesList.Add(barcode);
 		}
 
 		if (validBarCodesList.Count == 0)
 		{
-			Console.WriteLine("userKhadgalakh --- >> No active cards with points to register on device.");
-			return BadRequest("No active cards with points to register.");
+			string receivedDetails = string.Join(", ", barcodes.Select(b => 
+				$"[barcode: '{b.Barcode ?? "null"}', code: '{b.Code ?? "null"}', codeqr: '{b.CodeQr ?? "null"}', cardno: '{b.CardNo ?? "null"}', card_no: '{b.Card_No ?? "null"}']"
+			));
+			Console.WriteLine($"userKhadgalakh --- >> No active cards with points to register on device. Details: {receivedDetails}");
+			return BadRequest($"No active cards with points to register on device. Received details: {receivedDetails}");
 		}
 
 		string validBarCodesString = string.Join(",", validBarCodesList);
@@ -177,6 +209,9 @@ public class apiController : ControllerBase
 
 public class UserKhadgalakhRequest
 {
+	[JsonPropertyName("baiguullagiinId")]
+	public string BaiguullagiinId { get; set; }
+
 	[JsonPropertyName("barcodes")]
 	public List<BarcodeItem> Barcodes { get; set; } = new List<BarcodeItem>();
 }
@@ -185,6 +220,18 @@ public class BarcodeItem
 {
 	[JsonPropertyName("barcode")]
 	public object Barcode { get; set; }
+
+	[JsonPropertyName("code")]
+	public object Code { get; set; }
+
+	[JsonPropertyName("codeqr")]
+	public object CodeQr { get; set; }
+
+	[JsonPropertyName("cardno")]
+	public object CardNo { get; set; }
+
+	[JsonPropertyName("card_no")]
+	public object Card_No { get; set; }
 
 	[JsonPropertyName("point")]
 	public double Point { get; set; }

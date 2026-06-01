@@ -89,8 +89,9 @@ public class DeviceData
 			var registeredUsers = new System.Collections.Generic.Dictionary<string, string>(); // Pin -> CardNo
 			
 			// Retrieve currently enrolled users from the physical gate terminal using standard "Pin" query
+			Array.Clear(buffer, 0, buffer.Length);
 			int userResult = GetDeviceData(intPtr, ref buffer[0], BUFFERSIZE, "user", "Pin", "", "");
-			Console.WriteLine($"[AUTO-SYNC] userResult: {userResult}");
+			// Console.WriteLine($"[AUTO-SYNC] userResult: {userResult}");
 			if (userResult < 0)
 			{
 				Console.WriteLine($"[AUTO-SYNC] GetDeviceData(user) failed: {userResult}. Clearing active connection handle.");
@@ -101,7 +102,7 @@ public class DeviceData
 			if (userResult > 0)
 			{
 				string userText = Encoding.Default.GetString(buffer).Split('\0')[0];
-				Console.WriteLine($"[AUTO-SYNC] raw users:\n{userText}");
+				// Console.WriteLine($"[AUTO-SYNC] raw users:\n{userText}");
 				string[] userLines = userText.Replace("Pin=", "").Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
 				foreach (string line in userLines)
 				{
@@ -123,7 +124,9 @@ public class DeviceData
 				string cardNo = kvp.Key;
 				double points = kvp.Value;
 				
-				if (points > 0 && !registeredUsers.Values.Contains(cardNo))
+				bool shouldRegister = (points > 0 || points == -1.0);
+
+				if (shouldRegister && !registeredUsers.Values.Contains(cardNo))
 				{
 					// Resolve a new unique numeric PIN for this user
 					int newPin = 1000;
@@ -157,18 +160,27 @@ public class DeviceData
 				}
 			}
 
-			// 2. Sync depleted cards to hardware: Revoke/delete any users with 0 points from the gate
+			// 2. Sync depleted cards to hardware: Revoke/delete any users with 0 points or deleted from local DB
 			foreach (var kvp in registeredUsers.ToList())
 			{
 				string pin = kvp.Key;
 				string cardNo = kvp.Value;
 				
-				// If the card exists in local JSON and has 0 or less points, revoke it!
-				if (localDb.TryGetValue(cardNo, out double points) && points <= 0)
+				if (localDb.TryGetValue(cardNo, out double points))
 				{
+					if (points == 0)
+					{
+						DeleteDeviceData(intPtr, "userauthorize", "Pin=" + pin, "");
+						DeleteDeviceData(intPtr, "user", "Pin=" + pin, "");
+						Console.WriteLine($"[AUTO-SYNC] Automatically revoked card {cardNo} (PIN {pin}) from ZKTeco gate terminal.");
+					}
+				}
+				else
+				{
+					// If the card is registered on the device but not present in our local DB, it has been deleted/depleted! Clean it up!
 					DeleteDeviceData(intPtr, "userauthorize", "Pin=" + pin, "");
 					DeleteDeviceData(intPtr, "user", "Pin=" + pin, "");
-					Console.WriteLine($"[AUTO-SYNC] Automatically revoked card {cardNo} (PIN {pin}) from ZKTeco gate terminal.");
+					Console.WriteLine($"[AUTO-SYNC] Automatically cleaned up/deleted card {cardNo} (PIN {pin}) from ZKTeco gate terminal (not found in local database).");
 				}
 			}
 		}
@@ -182,14 +194,15 @@ public class DeviceData
 		string options = "";
 		string filter = "";
 		string tablename = "transaction";
+		Array.Clear(buffer, 0, buffer.Length);
 		int deviceData = GetDeviceData(intPtr, ref buffer[0], BUFFERSIZE, tablename, text, filter, options);
 		if (deviceData > 0)
 		{
 			string text2 = Encoding.Default.GetString(buffer).Split('\0')[0];
 			string[] lines = text2.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
 			
-			Console.WriteLine($"[AUTO-SYNC] Poll - totalLinesCount: {lines?.Length ?? 0}, _isWatermarkInitialized: {_isWatermarkInitialized}");
-			Console.WriteLine($"[AUTO-SYNC] Raw transactions:\n{text2}");
+			// Console.WriteLine($"[AUTO-SYNC] Poll - totalLinesCount: {lines?.Length ?? 0}, _isWatermarkInitialized: {_isWatermarkInitialized}");
+			// Console.WriteLine($"[AUTO-SYNC] Raw transactions:\n{text2}");
 			
 			if (!_isWatermarkInitialized)
 			{
@@ -217,7 +230,7 @@ public class DeviceData
 					}
 				}
 				_isWatermarkInitialized = true;
-				Console.WriteLine($"[AUTO-SYNC] Watermark initialized with {_processedKeys.Count} active transaction keys.");
+				// Console.WriteLine($"[AUTO-SYNC] Watermark initialized with {_processedKeys.Count} active transaction keys.");
 				return intPtr;
 			}
 			
@@ -265,11 +278,10 @@ public class DeviceData
 						
 						if (remainingEntries > 0)
 						{
-							bool success = await odooService.DecrementEntryAsync(cardNo, remainingEntries);
-							if (success)
+							int newCount = await odooService.DecrementEntryAsync(cardNo, remainingEntries);
+							if (newCount >= 0)
 							{
-								int newCount = remainingEntries - 1;
-								Console.WriteLine($"Successfully deducted entry in local DB. New remaining for {cardNo}: {newCount}");
+								Console.WriteLine($"Successfully deducted entry. New remaining for {cardNo}: {newCount}");
 								
 								if (newCount <= 0)
 								{
@@ -299,6 +311,8 @@ public class DeviceData
 				}
 			}
 			
+			Disconnect(intPtr);
+			_activeHandle = IntPtr.Zero;
 			return intPtr;
 		}
 		Console.WriteLine("GetDeviceData Emplty!" + deviceData);
@@ -330,12 +344,12 @@ public class DeviceData
 
 	public static IntPtr DeviceKholbolt(string ipaddress)
 	{
-		Console.WriteLine("Kholbolt ekhlekh");
-		Console.WriteLine("---------------->>" + ipaddress);
+		// Console.WriteLine("Kholbolt ekhlekh");
+		// Console.WriteLine("---------------->>" + ipaddress);
 		IntPtr intPtr = Connect("protocol=TCP,ipaddress=" + ipaddress + ",port=4370,timeout=5000,passwd=");
 		if (IntPtr.Zero != intPtr)
 		{
-			Console.WriteLine("Kholbolt amjilttai");
+			// Console.WriteLine("Kholbolt amjilttai");
 			return intPtr;
 		}
 		else
@@ -359,6 +373,7 @@ public class DeviceData
 		string options = "";
 		string filter = "";
 		string tablename = "user";
+		Array.Clear(buffer, 0, buffer.Length);
 		int num = GetDeviceData(intPtr, ref buffer[0], BUFFERSIZE, tablename, text, filter, options);
 		if (num >= 0)
 		{
