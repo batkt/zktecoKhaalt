@@ -17,6 +17,7 @@ public class OdooService
     private readonly ILogger<OdooService> _logger;
     private readonly string _dbFilePath;
     private static readonly object _fileLock = new object();
+    private static readonly Dictionary<string, DateTime> _lastLocalDecrementTimes = new Dictionary<string, DateTime>();
 
     public OdooService(HttpClient httpClient, OdooConfig config, ILogger<OdooService> logger)
     {
@@ -137,6 +138,9 @@ public class OdooService
     /// </summary>
     public async Task<int> GetRemainingEntriesAsync(string barcode)
     {
+        var localDb = LoadDatabase();
+        localDb.TryGetValue(barcode, out double localPoints);
+
         // 1. ALWAYS query Odoo first as the primary source of truth
         _logger.LogInformation("[ODOO] Checking Odoo first for barcode {Barcode}...", barcode);
         var odooInfo = await GetOdooCardInfoAsync(barcode);
@@ -146,10 +150,17 @@ public class OdooService
             _logger.LogInformation("[ODOO] Barcode {Barcode} found on Odoo. Live points: {Count}.", barcode, livePoints);
             
             // Sync with local DB if different (or not present)
-            var db = LoadDatabase();
-            if (!db.TryGetValue(barcode, out double localPoints) || localPoints != livePoints)
+            if (localPoints != livePoints)
             {
+                // If local points are lower and we recently decremented them, trust local points to prevent duplicate entry race conditions!
+                if (localPoints != -1.0 && localPoints < livePoints && _lastLocalDecrementTimes.TryGetValue(barcode, out DateTime lastDecTime) && (DateTime.Now - lastDecTime).TotalSeconds < 30)
+                {
+                    _logger.LogWarning("[SYNC] Local points ({Local}) are lower than Odoo points ({Genco}) and decremented recently. Trusting local points to prevent duplicate entry.", localPoints, livePoints);
+                    return (int)Math.Floor(localPoints);
+                }
+
                 _logger.LogInformation("[SYNC] Syncing local points for {Barcode} ({Local}) to match Genco absolute points ({Genco}).", barcode, localPoints, livePoints);
+                var db = LoadDatabase();
                 db[barcode] = (double)livePoints;
                 SaveDatabase(db);
             }
@@ -157,7 +168,6 @@ public class OdooService
         }
 
         // 2. Fallback: Check local membership database if not found on Odoo
-        var localDb = LoadDatabase();
         if (localDb.TryGetValue(barcode, out double points))
         {
             // If Genco returned successfully but indicated the card is inactive or deleted, revoke access immediately
@@ -184,6 +194,8 @@ public class OdooService
     /// <returns>The new remaining points (0 or greater), or -1 if the operation failed.</returns>
     public async Task<int> DecrementEntryAsync(string barcode, int currentPoints)
     {
+        _lastLocalDecrementTimes[barcode] = DateTime.Now;
+
         // 1. Try live Odoo decrement first (Odoo / Genco is absolute)
         _logger.LogInformation("[ODOO] Attempting live point decrement on Odoo for barcode {Barcode}...", barcode);
         var result = await DeductOdooCardPointAsync(barcode);

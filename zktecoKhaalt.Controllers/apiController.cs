@@ -51,20 +51,13 @@ public class apiController : ControllerBase
 	}
 
 	[HttpGet("clearUsers")]
-	public ActionResult<string> ClearUsers()
+	public async Task<ActionResult<string>> ClearUsers()
 	{
 		foreach (string ip in _cameraConfig.Ips)
 		{
 			if (string.IsNullOrWhiteSpace(ip)) continue;
 			
-			IntPtr intPtr = DeviceData.DeviceKholbolt(ip);
-			if (intPtr != IntPtr.Zero)
-			{
-				DeviceData.DeleteDeviceData(intPtr, "userauthorize", "~", "");
-				DeviceData.DeleteDeviceData(intPtr, "user", "~", "");
-				DeviceData.Disconnect(intPtr);
-				Console.WriteLine($"[CLEANUP] Successfully wiped all users from gate terminal {ip} to clear corrupt PIN memory.");
-			}
+			await DeviceData.ClearUsersAsync(ip);
 		}
 		return Ok("Gate user memory wiped successfully. The background sync will automatically re-enroll all active cards in 15 seconds!");
 	}
@@ -163,8 +156,16 @@ public class apiController : ControllerBase
 				var odooInfo = await _odooService.GetOdooCardInfoAsync(barcode);
 				if (odooInfo != null && odooInfo.Success && odooInfo.Data != null)
 				{
-					pointsToSave = -1.0;
-					Console.WriteLine($"[REGISTRATION] Barcode {barcode} detected as Odoo-managed. Automatically mapping to -1.0.");
+					if (odooInfo.Data.Points > 0 && odooInfo.Data.Active)
+					{
+						pointsToSave = -1.0;
+						Console.WriteLine($"[REGISTRATION] Barcode {barcode} detected as Odoo-managed and active with {odooInfo.Data.Points} points. Automatically mapping to -1.0.");
+					}
+					else
+					{
+						pointsToSave = 0.0;
+						Console.WriteLine($"[REGISTRATION] Barcode {barcode} found on Odoo but has {odooInfo.Data.Points} points or is inactive. Mapping to 0 points (revoked).");
+					}
 				}
 				else
 				{
@@ -178,7 +179,10 @@ public class apiController : ControllerBase
 
 			// Save the barcode's point allowance locally in our JSON database
 			await _odooService.SaveLocalMembershipPointsAsync(barcode, pointsToSave);
-			validBarCodesList.Add(barcode);
+			if (pointsToSave > 0 || pointsToSave == -1.0)
+			{
+				validBarCodesList.Add(barcode);
+			}
 		}
 
 		if (validBarCodesList.Count == 0)
