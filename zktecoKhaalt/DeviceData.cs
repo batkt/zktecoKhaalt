@@ -1,7 +1,9 @@
 using System;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -9,16 +11,17 @@ namespace zktecoKhaalt;
 
 public class DeviceData
 {
-	public static int BUFFERSIZE = 4194304;
+	public static int BUFFERSIZE = 1048576;
 
 	public static byte[] buffer = new byte[BUFFERSIZE];
 
 	private static readonly System.Collections.Generic.HashSet<string> _processedKeys = 
 		new System.Collections.Generic.HashSet<string>();
 
-	private static bool _isWatermarkInitialized = false;
+	private static readonly System.Collections.Generic.Dictionary<string, DateTime> _lastGateSyncTimes = 
+		new System.Collections.Generic.Dictionary<string, DateTime>();
 
-	private static readonly System.Collections.Generic.Dictionary<string, DateTime> _lastSwipeTimes = 
+	private static readonly System.Collections.Generic.Dictionary<string, DateTime> _lastConnectFailTimes = 
 		new System.Collections.Generic.Dictionary<string, DateTime>();
 
 	private static IntPtr _activeHandle = IntPtr.Zero;
@@ -75,6 +78,19 @@ public class DeviceData
 		return null;
 	}
 
+	public static long EncodeTime(DateTime dt)
+	{
+		long year = dt.Year;
+		long mon = dt.Month;
+		long day = dt.Day;
+		long hour = dt.Hour;
+		long min = dt.Minute;
+		long sec = dt.Second;
+		return ((year - 2000) * 12 * 31 + (mon - 1) * 31 + day - 1) * 86400 + (hour * 60 + min) * 60 + sec;
+	}
+
+
+
 	public static async Task<IntPtr> RefreshRemoveUser(string ipaddress, OdooService odooService)
 	{
 		await _sdkLock.WaitAsync();
@@ -85,115 +101,136 @@ public class DeviceData
 			intPtr = GetActiveConnection(ipaddress);
 			if (intPtr == IntPtr.Zero)
 			{
-				Console.WriteLine("RefreshRemoveUser: Connection failed. Aborting.");
+				Console.WriteLine($"RefreshRemoveUser: Connection to {ipaddress} failed. Aborting.");
 				return IntPtr.Zero;
 			}
 
 			// ==================== TWO-WAY AUTOMATIC GATE SYNCHRONIZATION ENGINE ====================
-			try
+			bool shouldSync = true;
+			if (_lastGateSyncTimes.TryGetValue(ipaddress, out DateTime lastSyncTime))
 			{
-				var localDb = await odooService.GetAllLocalMembershipsAsync();
-				var registeredUsers = new System.Collections.Generic.Dictionary<string, string>(); // Pin -> CardNo
-				
-				// Retrieve currently enrolled users from the physical gate terminal using standard "Pin" query
-				Array.Clear(buffer, 0, buffer.Length);
-				int userResult = GetDeviceData(intPtr, ref buffer[0], BUFFERSIZE, "user", "Pin", "", "");
-				// Console.WriteLine($"[AUTO-SYNC] userResult: {userResult}");
-				if (userResult < 0)
+				if ((DateTime.Now - lastSyncTime).TotalSeconds < 30)
 				{
-					Console.WriteLine($"[AUTO-SYNC] GetDeviceData(user) failed: {userResult}.");
-					hasError = true;
-					return IntPtr.Zero;
-				}
-				if (userResult > 0)
-				{
-					string userText = Encoding.Default.GetString(buffer).Split('\0')[0];
-					// Console.WriteLine($"[AUTO-SYNC] raw users:\n{userText}");
-					string[] userLines = userText.Replace("Pin=", "").Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
-					foreach (string line in userLines)
-					{
-						string pin = line.Trim();
-						if (!string.IsNullOrEmpty(pin) && pin != "0")
-						{
-							string cardNo = GetCardNoByPin(intPtr, pin);
-							if (!string.IsNullOrEmpty(cardNo))
-							{
-								registeredUsers[pin] = cardNo;
-							}
-						}
-					}
-				}
-
-				// 1. Sync local JSON to hardware: Add/enroll any active card numbers not currently on the gate
-				foreach (var kvp in localDb)
-				{
-					string cardNo = kvp.Key;
-					double points = kvp.Value;
-					
-					bool shouldRegister = (points > 0 || points == -1.0);
-
-					if (shouldRegister && !registeredUsers.Values.Contains(cardNo))
-					{
-						// Resolve a new unique numeric PIN for this user
-						int newPin = 1000;
-						if (registeredUsers.Keys.Count > 0)
-						{
-							var numericPins = registeredUsers.Keys
-								.Select(k => int.TryParse(k, out int p) ? p : 0)
-								.Where(p => p > 0)
-								.ToList();
-							if (numericPins.Count > 0)
-							{
-								newPin = numericPins.Max() + 1;
-							}
-						}
-						
-						string text7 = DateTime.Now.ToString("yyyyMMdd");
-						string textFuture = DateTime.Now.AddYears(10).ToString("yyyyMMdd");
-						string userStr = $"Pin={newPin}\tCardNo={cardNo}\tGroup=1\tStartTime={text7}\tEndTime={textFuture}";
-						string auth1Str = $"Pin={newPin}\tAuthorizeTimezoneId=1\tAuthorizeDoorId=1";
-						string auth2Str = $"Pin={newPin}\tAuthorizeTimezoneId=1\tAuthorizeDoorId=2";
-						
-						int rUser = SetDeviceData(intPtr, "user", userStr, "");
-						int rTz = SetDeviceData(intPtr, "timezone", "TimezoneId=1\tSunTime1=00002359\tMonTime1=00002359\tTueTime1=00002359\tWedTime1=00002359\tThuTime1=00002359\tFriTime1=00002359\tSatTime1=00002359", "");
-						int rAuth1 = SetDeviceData(intPtr, "userauthorize", auth1Str, "");
-						int rAuth2 = SetDeviceData(intPtr, "userauthorize", auth2Str, "");
-						int rMulti1 = SetDeviceData(intPtr, "multimcard", "Index=1\tDoorId=1\tGroup1=1", "");
-						int rMulti2 = SetDeviceData(intPtr, "multimcard", "Index=1\tDoorId=2\tGroup1=1", "");
-						
-						Console.WriteLine($"[AUTO-SYNC] Registered new card {cardNo} (PIN {newPin}) onto ZKTeco gate terminal. SetDeviceData results -> User: {rUser}, Tz: {rTz}, Auth1: {rAuth1}, Auth2: {rAuth2}, Multi1: {rMulti1}, Multi2: {rMulti2}");
-						registeredUsers[newPin.ToString()] = cardNo; // Add to in-memory list for dynamic consistency
-					}
-				}
-
-				// 2. Sync depleted cards to hardware: Revoke/delete any users with 0 points or deleted from local DB
-				foreach (var kvp in registeredUsers.ToList())
-				{
-					string pin = kvp.Key;
-					string cardNo = kvp.Value;
-					
-					if (localDb.TryGetValue(cardNo, out double points))
-					{
-						if (points == 0)
-						{
-							DeleteDeviceData(intPtr, "userauthorize", "Pin=" + pin, "");
-							DeleteDeviceData(intPtr, "user", "Pin=" + pin, "");
-							Console.WriteLine($"[AUTO-SYNC] Automatically revoked card {cardNo} (PIN {pin}) from ZKTeco gate terminal.");
-						}
-					}
-					else
-					{
-						// If the card is registered on the device but not present in our local DB, it has been deleted/depleted! Clean it up!
-						DeleteDeviceData(intPtr, "userauthorize", "Pin=" + pin, "");
-						DeleteDeviceData(intPtr, "user", "Pin=" + pin, "");
-						Console.WriteLine($"[AUTO-SYNC] Automatically cleaned up/deleted card {cardNo} (PIN {pin}) from ZKTeco gate terminal (not found in local database).");
-					}
+					shouldSync = false;
 				}
 			}
-			catch (Exception syncEx)
+
+			if (shouldSync)
 			{
-				Console.WriteLine("[AUTO-SYNC] Error during synchronization: " + syncEx.Message);
-				hasError = true;
+				_lastGateSyncTimes[ipaddress] = DateTime.Now;
+				try
+				{
+					var localDb = await odooService.GetAllLocalMembershipsAsync();
+					var registeredUsers = new System.Collections.Generic.Dictionary<string, string>(); // Pin -> CardNo
+					
+					// Retrieve currently enrolled users from the physical gate terminal using standard "Pin" query
+					Array.Clear(buffer, 0, buffer.Length);
+					int userResult = GetDeviceData(intPtr, ref buffer[0], BUFFERSIZE, "user", "Pin", "", "");
+					// Console.WriteLine($"[AUTO-SYNC] userResult: {userResult}");
+					if (userResult < 0)
+					{
+						Console.WriteLine($"[AUTO-SYNC] GetDeviceData(user) failed: {userResult}.");
+						hasError = true;
+						return IntPtr.Zero;
+					}
+					if (userResult > 0)
+					{
+						string userText = Encoding.Default.GetString(buffer).Split('\0')[0];
+						// Console.WriteLine($"[AUTO-SYNC] raw users:\n{userText}");
+						string[] userLines = userText.Replace("Pin=", "").Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+						foreach (string line in userLines)
+						{
+							string pin = line.Trim();
+							if (!string.IsNullOrEmpty(pin) && pin != "0")
+							{
+								string cardNo = GetCardNoByPin(intPtr, pin);
+								if (!string.IsNullOrEmpty(cardNo))
+								{
+									registeredUsers[pin] = cardNo;
+								}
+							}
+						}
+					}
+
+					// 1. Sync local JSON to hardware: Add/enroll any active card numbers not currently on the gate
+					foreach (var kvp in localDb)
+					{
+						string cardNo = kvp.Key;
+						double points = kvp.Value;
+						
+						bool shouldRegister = (points > 0 || points == -1.0);
+
+						if (shouldRegister && !registeredUsers.Values.Contains(cardNo))
+						{
+							// Resolve a new unique numeric PIN for this user
+							int newPin = 1000;
+							if (registeredUsers.Keys.Count > 0)
+							{
+								var numericPins = registeredUsers.Keys
+									.Select(k => int.TryParse(k, out int p) ? p : 0)
+									.Where(p => p > 0)
+									.ToList();
+								if (numericPins.Count > 0)
+								{
+									newPin = numericPins.Max() + 1;
+								}
+							}
+							
+							string text7 = DateTime.Now.ToString("yyyyMMdd");
+							string textFuture = DateTime.Now.AddYears(10).ToString("yyyyMMdd");
+							string userStr = $"Pin={newPin}\tCardNo={cardNo}\tGroup=1\tStartTime={text7}\tEndTime={textFuture}";
+							string auth1Str = $"Pin={newPin}\tAuthorizeTimezoneId=1\tAuthorizeDoorId=1";
+							string auth2Str = $"Pin={newPin}\tAuthorizeTimezoneId=1\tAuthorizeDoorId=2";
+							
+							int rUser = SetDeviceData(intPtr, "user", userStr, "");
+							int rTz = SetDeviceData(intPtr, "timezone", "TimezoneId=1\tSunTime1=00002359\tMonTime1=00002359\tTueTime1=00002359\tWedTime1=00002359\tThuTime1=00002359\tFriTime1=00002359\tSatTime1=00002359", "");
+							int rAuth1 = SetDeviceData(intPtr, "userauthorize", auth1Str, "");
+							int rAuth2 = SetDeviceData(intPtr, "userauthorize", auth2Str, "");
+							int rMulti1 = SetDeviceData(intPtr, "multimcard", "Index=1\tDoorId=1\tGroup1=1", "");
+							int rMulti2 = SetDeviceData(intPtr, "multimcard", "Index=1\tDoorId=2\tGroup1=1", "");
+							
+							Console.WriteLine($"[AUTO-SYNC] Registered new card {cardNo} (PIN {newPin}) onto ZKTeco gate terminal. SetDeviceData results -> User: {rUser}, Tz: {rTz}, Auth1: {rAuth1}, Auth2: {rAuth2}, Multi1: {rMulti1}, Multi2: {rMulti2}");
+							if (rUser < 0 || rTz < 0 || rAuth1 < 0 || rAuth2 < 0)
+							{
+								Console.WriteLine($"[AUTO-SYNC] SetDeviceData failed during enrollment. Marking handle as error.");
+								hasError = true;
+							}
+							else
+							{
+								registeredUsers[newPin.ToString()] = cardNo; // Add to in-memory list for dynamic consistency
+							}
+						}
+					}
+
+					// 2. Sync depleted cards to hardware: Revoke/delete any users with 0 points or deleted from local DB
+					foreach (var kvp in registeredUsers.ToList())
+					{
+						string pin = kvp.Key;
+						string cardNo = kvp.Value;
+						
+						if (localDb.TryGetValue(cardNo, out double points))
+						{
+							if (points == 0)
+							{
+								DeleteDeviceData(intPtr, "userauthorize", "Pin=" + pin, "");
+								DeleteDeviceData(intPtr, "user", "Pin=" + pin, "");
+								Console.WriteLine($"[AUTO-SYNC] Automatically revoked card {cardNo} (PIN {pin}) from ZKTeco gate terminal.");
+							}
+						}
+						else
+						{
+							// If the card is registered on the device but not present in our local DB, it has been deleted/depleted! Clean it up!
+							DeleteDeviceData(intPtr, "userauthorize", "Pin=" + pin, "");
+							DeleteDeviceData(intPtr, "user", "Pin=" + pin, "");
+							Console.WriteLine($"[AUTO-SYNC] Automatically cleaned up/deleted card {cardNo} (PIN {pin}) from ZKTeco gate terminal (not found in local database).");
+						}
+					}
+				}
+				catch (Exception syncEx)
+				{
+					Console.WriteLine("[AUTO-SYNC] Error during synchronization: " + syncEx.Message);
+					hasError = true;
+				}
 			}
 			// =======================================================================================
 
@@ -207,35 +244,6 @@ public class DeviceData
 			{
 				string text2 = Encoding.Default.GetString(buffer).Split('\0')[0];
 				string[] lines = text2.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
-				
-				if (!_isWatermarkInitialized)
-				{
-					if (lines != null)
-					{
-						foreach (string line in lines)
-						{
-							if (string.IsNullOrWhiteSpace(line) || line.StartsWith("Pin")) continue;
-							
-							string[] parts = line.Split(',');
-							if (parts.Length >= 3)
-							{
-								string pin = parts[0].Trim();
-								string cardNo = parts[1].Trim();
-								string timeSecStr = parts[2].Trim();
-								
-								if (string.IsNullOrEmpty(pin) || pin == "0" || pin == "1")
-								{
-									continue;
-								}
-								
-								string key = $"{pin}_{cardNo}_{timeSecStr}";
-								_processedKeys.Add(key);
-							}
-						}
-					}
-					_isWatermarkInitialized = true;
-					return intPtr;
-				}
 				
 				if (lines != null && lines.Length > 0)
 				{
@@ -263,17 +271,6 @@ public class DeviceData
 							
 							_processedKeys.Add(key);
 							Console.WriteLine($"[AUTO-SYNC] Detected new unique transaction: {key}");
-
-							// Debounce filter: Ignore duplicate swipes of the same card within 0.5 seconds
-							if (_lastSwipeTimes.TryGetValue(cardNo, out DateTime lastTime))
-							{
-								if ((DateTime.Now - lastTime).TotalSeconds < 0.5)
-								{
-									Console.WriteLine($"[DEBOUNCE] Ignored duplicate swipe for card {cardNo} (processed within 0.5 seconds).");
-									continue;
-								}
-							}
-							_lastSwipeTimes[cardNo] = DateTime.Now;
 
 							Console.WriteLine($"\n>>> [REALTIME GATE SCAN] {DateTime.Now:yyyy-MM-dd HH:mm:ss} | Gate: {ipaddress} | Card: {cardNo} | PIN: {pin}");
 							
@@ -312,6 +309,10 @@ public class DeviceData
 							}
 						}
 					}
+
+					// Clear processed transactions from the device to prevent buffer overflow (-106)
+					int deleteResult = DeleteDeviceData(intPtr, "transaction", "~", "");
+					Console.WriteLine($"[AUTO-SYNC] Processed transactions. Cleared device logs, result: {deleteResult}");
 				}
 				
 				return intPtr;
@@ -319,6 +320,12 @@ public class DeviceData
 			if (deviceData < 0)
 			{
 				Console.WriteLine("GetDeviceData Failed!" + deviceData);
+				if (deviceData == -106)
+				{
+					Console.WriteLine("[AUTO-SYNC] Data overflow (-106) detected. Wiping transaction logs on device to recover...");
+					int deleteResult = DeleteDeviceData(intPtr, "transaction", "~", "");
+					Console.WriteLine($"[AUTO-SYNC] Log wipe result: {deleteResult}");
+				}
 				hasError = true;
 				return PullLastError();
 			}
@@ -352,6 +359,15 @@ public class DeviceData
 			return _activeHandle;
 		}
 		
+		// Backoff check: If connection failed recently, wait 5 seconds before retrying
+		if (_lastConnectFailTimes.TryGetValue(ipaddress, out DateTime lastFailTime))
+		{
+			if ((DateTime.Now - lastFailTime).TotalSeconds < 5)
+			{
+				return IntPtr.Zero;
+			}
+		}
+		
 		if (_activeHandle != IntPtr.Zero)
 		{
 			Disconnect(_activeHandle);
@@ -363,25 +379,33 @@ public class DeviceData
 		{
 			_connectedIp = ipaddress;
 		}
+		else
+		{
+			_lastConnectFailTimes[ipaddress] = DateTime.Now;
+		}
 		return _activeHandle;
 	}
 
 	public static IntPtr DeviceKholbolt(string ipaddress)
 	{
-		// Console.WriteLine("Kholbolt ekhlekh");
-		// Console.WriteLine("---------------->>" + ipaddress);
-		IntPtr intPtr = Connect("protocol=TCP,ipaddress=" + ipaddress + ",port=4370,timeout=5000,passwd=");
+		// Try TCP first
+		IntPtr intPtr = Connect("protocol=TCP,ipaddress=" + ipaddress + ",port=4370,timeout=4000,passwd=");
 		if (IntPtr.Zero != intPtr)
 		{
-			// Console.WriteLine("Kholbolt amjilttai");
 			return intPtr;
 		}
-		else
+		
+		// Fallback to UDP
+		intPtr = Connect("protocol=UDP,ipaddress=" + ipaddress + ",port=4370,timeout=4000,passwd=");
+		if (IntPtr.Zero != intPtr)
 		{
-			IntPtr err = PullLastError();
-			Console.WriteLine("Connect device failed! Last Error: " + err);
-			return IntPtr.Zero;
+			Console.WriteLine($"Connect device {ipaddress} succeeded via UDP fallback.");
+			return intPtr;
 		}
+
+		IntPtr err = PullLastError();
+		Console.WriteLine($"Connect device {ipaddress} failed! Last Error: " + err);
+		return IntPtr.Zero;
 	}
 
 	public static IntPtr UserKhadgalakh(string ipAddress, string barCodes)

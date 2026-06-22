@@ -22,6 +22,7 @@ public class OdooService
     public OdooService(HttpClient httpClient, OdooConfig config, ILogger<OdooService> logger)
     {
         _httpClient = httpClient;
+        _httpClient.Timeout = TimeSpan.FromSeconds(5.0);
         _config = config;
         _logger = logger;
         
