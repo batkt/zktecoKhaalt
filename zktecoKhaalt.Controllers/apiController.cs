@@ -203,7 +203,7 @@ public class apiController : ControllerBase
 				continue;
 			}
 
-			IntPtr result = DeviceData.UserKhadgalakh(ip, validBarCodesString);
+			IntPtr result = await DeviceData.UserKhadgalakh(ip, validBarCodesString);
 			Console.WriteLine($"userKhadgalakh {ip} --- >> {result}");
 		}
 

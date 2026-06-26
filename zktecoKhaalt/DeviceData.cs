@@ -13,7 +13,8 @@ public class DeviceData
 {
 	public static int BUFFERSIZE = 1048576;
 
-	public static byte[] buffer = new byte[BUFFERSIZE];
+	// NOTE: Do NOT use a shared static buffer — each call must allocate its own local buffer
+	// to prevent data corruption when RefreshRemoveUser and UserKhadgalakh overlap.
 
 	private static readonly System.Collections.Generic.HashSet<string> _processedKeys = 
 		new System.Collections.Generic.HashSet<string>();
@@ -89,6 +90,28 @@ public class DeviceData
 		return ((year - 2000) * 12 * 31 + (mon - 1) * 31 + day - 1) * 86400 + (hour * 60 + min) * 60 + sec;
 	}
 
+	/// <summary>
+	/// Reverses ZKTeco's EncodeTime. Returns null if the encoded value is invalid.
+	/// </summary>
+	public static DateTime? DecodeTime(long encoded)
+	{
+		try
+		{
+			long totalSec = encoded % 86400;
+			long days    = encoded / 86400;
+			int  sec  = (int)(totalSec % 60);
+			int  min  = (int)((totalSec / 60) % 60);
+			int  hour = (int)(totalSec / 3600);
+			int  day  = (int)(days % 31) + 1;
+			int  mon  = (int)((days / 31) % 12) + 1;
+			int  year = (int)(days / (12 * 31)) + 2000;
+			return new DateTime(year, mon, day, hour, min, sec);
+		}
+		catch
+		{
+			return null;
+		}
+	}
 
 
 	public static async Task<IntPtr> RefreshRemoveUser(string ipaddress, OdooService odooService)
@@ -124,8 +147,8 @@ public class DeviceData
 					var registeredUsers = new System.Collections.Generic.Dictionary<string, string>(); // Pin -> CardNo
 					
 					// Retrieve currently enrolled users from the physical gate terminal using standard "Pin" query
-					Array.Clear(buffer, 0, buffer.Length);
-					int userResult = GetDeviceData(intPtr, ref buffer[0], BUFFERSIZE, "user", "Pin", "", "");
+					byte[] syncBuffer = new byte[BUFFERSIZE]; // local buffer per call
+					int userResult = GetDeviceData(intPtr, ref syncBuffer[0], BUFFERSIZE, "user", "Pin", "", "");
 					// Console.WriteLine($"[AUTO-SYNC] userResult: {userResult}");
 					if (userResult < 0)
 					{
@@ -135,7 +158,7 @@ public class DeviceData
 					}
 					if (userResult > 0)
 					{
-						string userText = Encoding.Default.GetString(buffer).Split('\0')[0];
+						string userText = Encoding.Default.GetString(syncBuffer).Split('\0')[0];
 						// Console.WriteLine($"[AUTO-SYNC] raw users:\n{userText}");
 						string[] userLines = userText.Replace("Pin=", "").Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
 						foreach (string line in userLines)
@@ -238,51 +261,65 @@ public class DeviceData
 			string options = "";
 			string filter = "";
 			string tablename = "transaction";
-			Array.Clear(buffer, 0, buffer.Length);
-			int deviceData = GetDeviceData(intPtr, ref buffer[0], BUFFERSIZE, tablename, text, filter, options);
+			byte[] txBuffer = new byte[BUFFERSIZE]; // local buffer per call
+			int deviceData = GetDeviceData(intPtr, ref txBuffer[0], BUFFERSIZE, tablename, text, filter, options);
 			if (deviceData > 0)
 			{
-				string text2 = Encoding.Default.GetString(buffer).Split('\0')[0];
+				string text2 = Encoding.Default.GetString(txBuffer).Split('\0')[0];
 				string[] lines = text2.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
-				
+
 				if (lines != null && lines.Length > 0)
 				{
+					// *** CRITICAL: Delete transactions from device FIRST before processing. ***
+					// This ensures that if the service crashes or restarts mid-cycle, the same
+					// transactions will NOT be re-processed on the next startup (double-open bug).
+					int deleteResult = DeleteDeviceData(intPtr, "transaction", "~", "");
+					Console.WriteLine($"[AUTO-SYNC] Cleared device transaction log before processing. Result: {deleteResult}");
+
+					DateTime cutoff = DateTime.Now.AddMinutes(-10);
+
 					foreach (string line in lines)
 					{
 						if (string.IsNullOrWhiteSpace(line) || line.StartsWith("Pin")) continue;
-						
+
 						string[] parts = line.Split(',');
 						if (parts.Length >= 3)
 						{
-							string pin = parts[0].Trim();
-							string cardNo = parts[1].Trim();
+							string pin       = parts[0].Trim();
+							string cardNo    = parts[1].Trim();
 							string timeSecStr = parts[2].Trim();
-							
-							if (string.IsNullOrEmpty(pin) || pin == "0" || pin == "1")
+
+							if (string.IsNullOrEmpty(pin) || pin == "0" || pin == "1") continue;
+
+							// *** STALE TRANSACTION GUARD ***
+							// On service restart, the device still holds old transaction logs.
+							// Ignore any transaction older than 10 minutes to prevent double-opens.
+							if (long.TryParse(timeSecStr, out long encodedTime))
 							{
-								continue;
+								DateTime? txTime = DecodeTime(encodedTime);
+								if (txTime.HasValue && txTime.Value < cutoff)
+								{
+									Console.WriteLine($"[AUTO-SYNC] Skipping stale transaction (age > 10 min): PIN={pin}, Card={cardNo}, TxTime={txTime.Value:HH:mm:ss}");
+									continue;
+								}
 							}
-							
+
 							string key = $"{pin}_{cardNo}_{timeSecStr}";
-							if (_processedKeys.Contains(key))
-							{
-								continue;
-							}
-							
+							if (_processedKeys.Contains(key)) continue;
+
 							_processedKeys.Add(key);
 							Console.WriteLine($"[AUTO-SYNC] Detected new unique transaction: {key}");
-
 							Console.WriteLine($"\n>>> [REALTIME GATE SCAN] {DateTime.Now:yyyy-MM-dd HH:mm:ss} | Gate: {ipaddress} | Card: {cardNo} | PIN: {pin}");
-							
+
 							int remainingEntries = await odooService.GetRemainingEntriesAsync(cardNo);
-							
+
 							if (remainingEntries > 0)
 							{
 								int newCount = await odooService.DecrementEntryAsync(cardNo, remainingEntries);
 								if (newCount >= 0)
 								{
 									Console.WriteLine($"Successfully deducted entry. New remaining for {cardNo}: {newCount}");
-									
+
 									if (newCount <= 0)
 									{
 										Console.WriteLine($"Entries depleted for {cardNo}. Revoking gate access.");
@@ -309,12 +346,8 @@ public class DeviceData
 							}
 						}
 					}
-
-					// Clear processed transactions from the device to prevent buffer overflow (-106)
-					int deleteResult = DeleteDeviceData(intPtr, "transaction", "~", "");
-					Console.WriteLine($"[AUTO-SYNC] Processed transactions. Cleared device logs, result: {deleteResult}");
 				}
-				
+
 				return intPtr;
 			}
 			if (deviceData < 0)
@@ -354,26 +387,39 @@ public class DeviceData
 
 	public static IntPtr GetActiveConnection(string ipaddress)
 	{
+		// If we have a cached handle for this IP, probe it first to confirm the session is alive.
+		// ZKTeco devices drop idle SDK sessions silently — reusing a dead handle returns -2.
 		if (_activeHandle != IntPtr.Zero && _connectedIp == ipaddress)
 		{
-			return _activeHandle;
+			int probe = GetDeviceDataCount(_activeHandle, "user", "", "");
+			if (probe >= 0)
+			{
+				// Handle is alive — reuse it
+				return _activeHandle;
+			}
+			// Session is dead — clean up and reconnect below
+			Console.WriteLine($"[GetActiveConnection] Cached handle for {ipaddress} is stale (probe={probe}). Reconnecting.");
+			Disconnect(_activeHandle);
+			_activeHandle = IntPtr.Zero;
+			_connectedIp = "";
 		}
-		
-		// Backoff check: If connection failed recently, wait 5 seconds before retrying
+
+		// Backoff check: If connection failed recently, wait 10 seconds before retrying
 		if (_lastConnectFailTimes.TryGetValue(ipaddress, out DateTime lastFailTime))
 		{
-			if ((DateTime.Now - lastFailTime).TotalSeconds < 5)
+			if ((DateTime.Now - lastFailTime).TotalSeconds < 10)
 			{
+				Console.WriteLine($"[GetActiveConnection] Backoff active for {ipaddress}. Skipping reconnect.");
 				return IntPtr.Zero;
 			}
 		}
-		
+
 		if (_activeHandle != IntPtr.Zero)
 		{
 			Disconnect(_activeHandle);
 			_activeHandle = IntPtr.Zero;
 		}
-		
+
 		_activeHandle = DeviceKholbolt(ipaddress);
 		if (_activeHandle != IntPtr.Zero)
 		{
@@ -388,29 +434,36 @@ public class DeviceData
 
 	public static IntPtr DeviceKholbolt(string ipaddress)
 	{
-		// Try TCP first
-		IntPtr intPtr = Connect("protocol=TCP,ipaddress=" + ipaddress + ",port=4370,timeout=4000,passwd=");
-		if (IntPtr.Zero != intPtr)
+		// ZKTeco C3/F-series SDK connect: try multiple comm key variants.
+		// Error -2 = handshake rejected, usually due to wrong Comm Key.
+		// Common device defaults: empty string, "0", or numeric 0.
+		var attempts = new[]
 		{
-			return intPtr;
-		}
-		
-		// Fallback to UDP
-		intPtr = Connect("protocol=UDP,ipaddress=" + ipaddress + ",port=4370,timeout=4000,passwd=");
-		if (IntPtr.Zero != intPtr)
+			$"protocol=TCP,ipaddress={ipaddress},port=4370,timeout=4000,passwd=",
+			$"protocol=TCP,ipaddress={ipaddress},port=4370,timeout=4000,passwd=0",
+			$"protocol=UDP,ipaddress={ipaddress},port=4370,timeout=4000,passwd=",
+			$"protocol=UDP,ipaddress={ipaddress},port=4370,timeout=4000,passwd=0",
+		};
+
+		foreach (var connStr in attempts)
 		{
-			Console.WriteLine($"Connect device {ipaddress} succeeded via UDP fallback.");
-			return intPtr;
+			IntPtr intPtr = Connect(connStr);
+			if (IntPtr.Zero != intPtr)
+			{
+				Console.WriteLine($"[DeviceKholbolt] Connected to {ipaddress} using: {connStr}");
+				return intPtr;
+			}
+			IntPtr err = PullLastError();
+			Console.WriteLine($"[DeviceKholbolt] Attempt failed ({connStr}) — LastError: {err}");
 		}
 
-		IntPtr err = PullLastError();
-		Console.WriteLine($"Connect device {ipaddress} failed! Last Error: " + err);
+		Console.WriteLine($"[DeviceKholbolt] All connect attempts to {ipaddress} failed.");
 		return IntPtr.Zero;
 	}
 
-	public static IntPtr UserKhadgalakh(string ipAddress, string barCodes)
+	public static async Task<IntPtr> UserKhadgalakh(string ipAddress, string barCodes)
 	{
-		_sdkLock.Wait();
+		await _sdkLock.WaitAsync(); // Use async wait to avoid blocking thread pool threads
 		IntPtr intPtr = IntPtr.Zero;
 		bool hasError = false;
 		try
@@ -426,15 +479,15 @@ public class DeviceData
 			string options = "";
 			string filter = "";
 			string tablename = "user";
-			Array.Clear(buffer, 0, buffer.Length);
-			int num = GetDeviceData(intPtr, ref buffer[0], BUFFERSIZE, tablename, text, filter, options);
+			byte[] localBuffer = new byte[BUFFERSIZE]; // local buffer — never share static buffer
+			int num = GetDeviceData(intPtr, ref localBuffer[0], BUFFERSIZE, tablename, text, filter, options);
 			if (num >= 0)
 			{
 				Console.WriteLine("GetDeviceData ---->" + num);
 				if (num > 0)
 				{
 					int maxPin = 1000;
-					string text2 = Encoding.Default.GetString(buffer).Split('\0')[0];
+					string text2 = Encoding.Default.GetString(localBuffer).Split('\0')[0];
 					string[] array = text2.Replace("Pin=", "").Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
 					if (array != null && array.Length != 0)
 					{

@@ -29,7 +29,15 @@ public class BackgroundWorkerService : BackgroundService
 			{
 				_logger.LogError(exception, "Heartbeat aldaa");
 			}
-			await Task.Delay(TimeSpan.FromMilliseconds(200.0), stoppingToken);
+			try
+			{
+				await Task.Delay(TimeSpan.FromMilliseconds(3000.0), stoppingToken);
+			}
+			catch (TaskCanceledException)
+			{
+				// Normal on graceful shutdown — exit the loop cleanly
+				break;
+			}
 		}
 	}
 }
